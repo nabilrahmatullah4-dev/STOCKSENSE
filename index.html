@@ -1,0 +1,463 @@
+<!DOCTYPE html>
+<html lang="id">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Scanner Barcode Produk &amp; GSheet</title>
+    <script src="https://unpkg.com/html5-qrcode" type="text/javascript"></script>
+    <style>
+        body {
+            margin: 0;
+            padding: 20px;
+            font-family: Arial, sans-serif;
+            background: #f4f6f8;
+            color: #222;
+        }
+        
+        .container {
+            max-width: 900px;
+            margin: 0 auto;
+            padding: 20px;
+            background: #fff;
+            border-radius: 10px;
+            box-shadow: 0 2px 12px rgba(0, 0, 0, 0.08);
+        }
+        
+        .camera-buttons {
+            display: flex;
+            flex-wrap: wrap;
+            gap: 10px;
+            justify-content: center;
+            margin-bottom: 15px;
+        }
+
+        .manual-entry {
+            display: flex;
+            flex-wrap: wrap;
+            justify-content: center;
+            gap: 10px;
+            margin: 15px 0;
+        }
+
+        .manual-entry input {
+            flex: 1 1 220px;
+            max-width: 320px;
+            padding: 9px;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+        }
+        
+        button {
+            padding: 9px 14px;
+            border: 0;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+        
+        #reader {
+            width: 100%;
+            max-width: 500px;
+            margin: 20px auto;
+        }
+        
+        .table-wrapper {
+            overflow-x: auto;
+        }
+        
+        table {
+            width: 100%;
+            border-collapse: collapse;
+            text-align: left;
+        }
+        
+        th,
+        td {
+            padding: 8px;
+            border: 1px solid #ccc;
+        }
+        
+        #confirmModal {
+            display: none;
+            position: fixed;
+            z-index: 10;
+            inset: 0;
+            overflow-y: auto;
+            background: rgba(0, 0, 0, 0.5);
+        }
+        
+        .modal-content {
+            width: min(300px, calc(100% - 64px));
+            margin: 100px auto 20px;
+            padding: 20px;
+            border-radius: 8px;
+            background: #fff;
+            text-align: center;
+        }
+        
+        @media (max-width: 480px) {
+            body {
+                padding: 10px;
+            }
+            .container {
+                padding: 14px;
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <main class="container">
+        <h2>Scanner Barcode Produk</h2>
+        <div class="camera-buttons">
+            <button type="button" onclick="startCamera()">📷 Buka / Restart Kamera</button>
+            <button type="button" onclick="switchCamera()">🔄 Ganti Kamera (Depan/Belakang)</button>
+        </div>
+
+        <form class="manual-entry" onsubmit="submitManualBarcode(event)">
+            <input id="manual-barcode" type="text" inputmode="text" autocomplete="off"
+                placeholder="Masukkan nomor barcode secara manual" aria-label="Nomor barcode manual" required>
+            <button type="submit">Cari Barcode</button>
+        </form>
+
+        <div id="reader"></div>
+        <p id="status-text" role="status" aria-live="polite">
+            Klik tombol untuk menyalakan kamera. Hasil scan akan dikirim ke ESP8266.
+        </p>
+
+        <h3>Riwayat Scan</h3>
+        <div class="table-wrapper">
+            <table>
+                <thead>
+                    <tr>
+                        <th>Waktu</th>
+                        <th>Barcode</th>
+                        <th>Nama Barang</th>
+                        <th>Status</th>
+                    </tr>
+                </thead>
+                <tbody id="table-body"></tbody>
+            </table>
+        </div>
+    </main>
+
+    <div id="confirmModal" role="dialog" aria-modal="true" aria-labelledby="modal-title">
+        <div class="modal-content">
+            <h3 id="modal-title">Hasil Scan</h3>
+            <p>Barcode: <b id="scanned-code">-</b></p>
+
+            <div style="background: #f0f0f0; padding: 10px; margin: 10px 0;">
+                <p style="margin: 5px 0;">Barang: <b id="item-name">Mencari...</b></p>
+                <p style="margin: 5px 0;">Harga: <b id="item-price">-</b></p>
+            </div>
+
+            <p>Konfirmasi Pembelian?</p>
+            <button type="button" onclick="prosesKonfirmasi('Ya (Beli)')" style="background: green; color: white; padding: 8px 15px;">Ya</button>
+            <button type="button" onclick="prosesKonfirmasi('Tidak (Batal)')" style="background: red; color: white; padding: 8px 15px;">Tidak</button>
+        </div>
+    </div>
+
+    <script>
+        // Ganti URL ini dengan URL Web App Google Apps Script Anda.
+        const SPREADSHEET_URL = "https://script.google.com/macros/s/AKfycby4KwEt-LHus8pOF2keQrnKnkmJ4DIFCZ8P-Xommqb901E8-UP3m73tI2IYjwuK9jF3EA/exec";
+
+        const ESP8266_IP = "192.168.1.36";
+
+        let scannedBarcode = "";
+        let scannedNamaBarang = "-";
+        let html5QrCode;
+        let currentCameraIndex = 0;
+        let availableCameras = [];
+
+        async function startCamera() {
+            document.getElementById("status-text").innerText = "Meminta akses kamera...";
+
+            if (!html5QrCode) {
+                html5QrCode = new Html5Qrcode("reader");
+            }
+
+            if (html5QrCode.isScanning) {
+                await html5QrCode.stop();
+            }
+
+            const config = {
+                fps: 20,
+                qrbox: {
+                    width: 300,
+                    height: 150
+                },
+                formatsToSupport: [
+                    Html5QrcodeSupportedFormats.EAN_13,
+                    Html5QrcodeSupportedFormats.EAN_8,
+                    Html5QrcodeSupportedFormats.CODE_128,
+                    Html5QrcodeSupportedFormats.UPC_A,
+                    Html5QrcodeSupportedFormats.UPC_E
+                ]
+            };
+
+            try {
+                const devices = await Html5Qrcode.getCameras();
+                availableCameras = devices.filter((camera) => {
+                    const label = camera.label.toLowerCase();
+                    return !label.includes("ultra") && !label.includes("wide 0.5");
+                });
+
+                if (availableCameras.length === 0) {
+                    availableCameras = devices;
+                }
+
+                if (availableCameras.length === 0) {
+                    document.getElementById("status-text").innerText =
+                        "Tidak ada perangkat kamera yang terdeteksi.";
+                    return;
+                }
+
+                let selectedCameraId = availableCameras[0].id;
+                if (availableCameras.length > 1) {
+                    const mainBackCamera = availableCameras.find((camera) => {
+                        const label = camera.label.toLowerCase();
+                        return (label.includes("back") || label.includes("rear") ||
+                                label.includes("belakang")) &&
+                            !label.includes("0.5") && !label.includes("depth");
+                    });
+
+                    if (mainBackCamera) {
+                        selectedCameraId = mainBackCamera.id;
+                        currentCameraIndex = availableCameras.indexOf(mainBackCamera);
+                    } else {
+                        currentCameraIndex = 0;
+                    }
+                }
+
+                await html5QrCode.start(selectedCameraId, config, onScanSuccess);
+                applyAutoFocus();
+                document.getElementById("status-text").innerText =
+                    "Arahkan barcode ke kamera...";
+            } catch (error) {
+                document.getElementById("status-text").innerText =
+                    "Gagal membuka kamera: " + error;
+            }
+        }
+
+        function applyAutoFocus() {
+            try {
+                const videoElement = document.querySelector("#reader video");
+                if (!videoElement || !videoElement.srcObject) {
+                    return;
+                }
+
+                const track = videoElement.srcObject.getVideoTracks()[0];
+                const capabilities = track.getCapabilities ? track.getCapabilities() : {};
+                if (capabilities.focusMode &&
+                    capabilities.focusMode.includes("continuous")) {
+                    track.applyConstraints({
+                        advanced: [{
+                            focusMode: "continuous"
+                        }]
+                    }).catch((error) => {
+                        console.log("Auto focus tidak didukung di constraint ini:", error);
+                    });
+                }
+            } catch (error) {
+                console.warn("Gagal menerapkan Auto Focus:", error);
+            }
+        }
+
+        async function switchCamera() {
+            if (availableCameras.length <= 1) {
+                alert("Hanya ada 1 kamera yang sesuai terdeteksi.");
+                return;
+            }
+
+            currentCameraIndex = (currentCameraIndex + 1) % availableCameras.length;
+            const nextCameraId = availableCameras[currentCameraIndex].id;
+            const config = {
+                fps: 20,
+                qrbox: {
+                    width: 300,
+                    height: 150
+                },
+                formatsToSupport: [
+                    Html5QrcodeSupportedFormats.EAN_13,
+                    Html5QrcodeSupportedFormats.EAN_8,
+                    Html5QrcodeSupportedFormats.CODE_128,
+                    Html5QrcodeSupportedFormats.UPC_A,
+                    Html5QrcodeSupportedFormats.UPC_E
+                ]
+            };
+
+            try {
+                if (html5QrCode && html5QrCode.isScanning) {
+                    await html5QrCode.stop();
+                }
+                await html5QrCode.start(nextCameraId, config, onScanSuccess);
+                applyAutoFocus();
+                document.getElementById("status-text").innerText =
+                    "Kamera berhasil diubah.";
+            } catch (error) {
+                document.getElementById("status-text").innerText =
+                    "Gagal mengganti kamera: " + error;
+            }
+        }
+
+        async function onScanSuccess(decodedText) {
+            if (html5QrCode.isScanning) {
+                await html5QrCode.stop();
+            }
+
+            await processBarcode(decodedText);
+        }
+
+        async function submitManualBarcode(event) {
+            event.preventDefault();
+            const barcode = document.getElementById("manual-barcode").value.trim();
+            if (!barcode) {
+                document.getElementById("status-text").innerText =
+                    "Masukkan nomor barcode terlebih dahulu.";
+                return;
+            }
+
+            if (html5QrCode && html5QrCode.isScanning) {
+                await html5QrCode.stop();
+            }
+
+            document.getElementById("manual-barcode").value = "";
+            await processBarcode(barcode);
+        }
+
+        async function processBarcode(barcode) {
+            scannedBarcode = barcode;
+            scannedNamaBarang = "-";
+            document.getElementById("scanned-code").innerText = scannedBarcode;
+            document.getElementById("item-name").innerText = "Mencari di GSheet...";
+            document.getElementById("item-price").innerText = "-";
+            document.getElementById("confirmModal").style.display = "block";
+
+            await cariDataDiGSheet(scannedBarcode);
+        }
+
+        async function cariDataDiGSheet(barcode) {
+            try {
+                const response = await fetch(
+                    `${SPREADSHEET_URL}?barcode=${encodeURIComponent(barcode)}`
+                );
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+                const result = await response.json();
+
+                if (result.found) {
+                    scannedNamaBarang = result.namaBarang;
+                    document.getElementById("item-name").innerText = result.namaBarang;
+                    document.getElementById("item-price").innerText =
+                        "Rp " + Number(result.harga).toLocaleString("id-ID");
+                } else {
+                    scannedNamaBarang = "Tidak Terdaftar";
+                    document.getElementById("item-name").innerText =
+                        "❌ Tidak Ada di Database";
+                    document.getElementById("item-price").innerText = "-";
+                }
+                await kirimHasilKeESP(
+                    scannedNamaBarang,
+                    result.found ? String(result.harga) : "-"
+                );
+            } catch (error) {
+                console.error("Error panggil GSheet:", error);
+                scannedNamaBarang = "Gagal Koneksi GSheet";
+                document.getElementById("item-name").innerText =
+                    "⚠️ Gagal Koneksi GSheet";
+                await kirimHasilKeESP(scannedNamaBarang, "-");
+            }
+        }
+
+        async function kirimHasilKeESP(namaBarang, hargaBarang) {
+            document.getElementById("status-text").innerText =
+                "Mengirim hasil scan ke ESP8266...";
+
+            try {
+                const response = await fetch(`http://${ESP8266_IP}/scan`, {
+                    method: "POST",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify({
+                        namaBarang: String(namaBarang),
+                        hargaBarang: String(hargaBarang)
+                    })
+                });
+                if (!response.ok) {
+                    throw new Error(`HTTP ${response.status}`);
+                }
+
+                const result = await response.json();
+                if (result.status !== "success") {
+                    throw new Error(result.message || "ESP8266 menolak data scan.");
+                }
+                document.getElementById("status-text").innerText =
+                    "Hasil scan berhasil ditampilkan di ESP8266.";
+            } catch (error) {
+                console.error("Gagal mengirim hasil scan ke ESP8266:", error);
+                document.getElementById("status-text").innerText =
+                    `Gagal mengirim hasil ke ESP8266 (${ESP8266_IP}). Pastikan IP benar dan perangkat terhubung ke Wi-Fi yang sama.`;
+            }
+        }
+
+        async function prosesKonfirmasi(jawaban) {
+            document.getElementById("confirmModal").style.display = "none";
+
+            const newEntry = {
+                waktu: new Date().toLocaleString("id-ID"),
+                barcode: scannedBarcode,
+                namaBarang: scannedNamaBarang,
+                status: jawaban
+            };
+
+            document.getElementById("status-text").innerText =
+                "Menyimpan ke Google Sheets...";
+            try {
+                await fetch(SPREADSHEET_URL, {
+                    method: "POST",
+                    mode: "no-cors",
+                    headers: {
+                        "Content-Type": "application/json"
+                    },
+                    body: JSON.stringify(newEntry)
+                });
+            } catch (error) {
+                console.error("Gagal simpan riwayat:", error);
+                document.getElementById("status-text").innerText =
+                    "Gagal menyimpan riwayat ke Google Sheets.";
+            }
+
+            tambahKeTabelLokal(newEntry);
+            document.getElementById("status-text").innerText =
+                "Menyiapkan kamera kembali...";
+            await startCamera();
+        }
+
+        function tambahKeTabelLokal(data) {
+            const tbody = document.getElementById("table-body");
+            const row = document.createElement("tr");
+            const values = [data.waktu, data.barcode, data.namaBarang, data.status];
+
+            values.forEach((value, index) => {
+                const cell = document.createElement("td");
+                if (index === 1) {
+                    const barcode = document.createElement("b");
+                    barcode.textContent = value;
+                    cell.appendChild(barcode);
+                } else {
+                    cell.textContent = value;
+                }
+                if (index === 3) {
+                    cell.style.color = data.status.includes("Ya") ? "green" : "red";
+                }
+                row.appendChild(cell);
+            });
+
+            tbody.insertBefore(row, tbody.firstChild);
+        }
+    </script>
+</body>
+
+</html>
